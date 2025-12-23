@@ -1,0 +1,1398 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+# ============================================================
+# STEP 1: DATA PREPARATION & PLANT PRUNING
+# ============================================================
+# Objective:
+# - Clean raw datasets
+# - Handle missing values systematically
+# - Quantify plant performance using RMSE
+# - REMOVE worst-performing 25% of plants
+# - Save cleaned outputs for Step 2
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.impute import SimpleImputer
+import os
+
+sns.set_style("whitegrid")
+os.makedirs("processed", exist_ok=True)
+
+# ------------------------------------------------------------
+# 1. LOAD RAW DATA
+# ------------------------------------------------------------
+dem_raw = pd.read_csv("demand.csv")
+pl_raw  = pd.read_csv("plants.csv")
+cost_raw = pd.read_csv("generation_costs.csv")
+
+print("=== RAW DATA SHAPES ===")
+print("Demand:", dem_raw.shape)
+print("Plants:", pl_raw.shape)
+print("Costs :", cost_raw.shape)
+
+# ------------------------------------------------------------
+# 2. REGION CODE CLEANING (NA → NAM)
+# ------------------------------------------------------------
+# Region code for North America 'NA' is read as a NaN value by Pandas.
+# Thus needs to be replaced to retain the categorical information
+if "DF_region" in dem_raw.columns:
+    dem_raw["DF_region"] = dem_raw["DF_region"].replace("NA", "NAM")
+    dem_raw["DF_region"] = dem_raw["DF_region"].fillna("NAM")
+
+if "Region" in pl_raw.columns:
+    pl_raw["Region"] = pl_raw["Region"].replace("NA", "NAM")
+    pl_raw["Region"] = pl_raw["Region"].fillna("NAM")
+
+print("\n✓ Region codes standardised (NA → NAM)")
+
+# ------------------------------------------------------------
+# 3. MISSING VALUE SUMMARY (BEFORE)
+# ------------------------------------------------------------
+def missing_report(df, name):
+    rep = pd.DataFrame({
+        "Missing_Count": df.isna().sum(),
+        "Missing_%": (df.isna().sum() / len(df) * 100).round(2)
+    })
+    print(f"\n=== Missing Values in {name} (Before) ===")
+    print(rep)
+    return rep
+
+miss_dem_before = missing_report(dem_raw, "Demand")
+miss_pl_before  = missing_report(pl_raw, "Plants")
+miss_cost_before = missing_report(cost_raw, "Costs")
+
+miss_dem_before.to_csv("processed/missing_demand_before.csv")
+miss_pl_before.to_csv("processed/missing_plants_before.csv")
+miss_cost_before.to_csv("processed/missing_costs_before.csv")
+
+# ------------------------------------------------------------
+# 4. HANDLE MISSING VALUES
+# ------------------------------------------------------------
+
+# Categorical → mode
+for col in dem_raw.select_dtypes(include="object").columns:
+    dem_raw[col] = dem_raw[col].fillna(dem_raw[col].mode()[0])
+
+for col in pl_raw.select_dtypes(include="object").columns:
+    pl_raw[col] = pl_raw[col].fillna(pl_raw[col].mode()[0])
+
+# Numeric → The strategy used is median as it's sensitive to outliers 
+# as compared to mean
+med_imputer = SimpleImputer(strategy="median")
+
+def median_impute(df, label):
+    num_cols = df.select_dtypes(include=np.number).columns
+    miss_count = df[num_cols].isna().sum().sum()
+    if miss_count > 0:
+        df[num_cols] = med_imputer.fit_transform(df[num_cols])
+        print(f"{label}: Imputed {miss_count} numeric values using median.")
+    else:
+        print(f"{label}: No numeric missing values.")
+    return df
+
+dem_raw = median_impute(dem_raw, "Demand")
+pl_raw  = median_impute(pl_raw, "Plants")
+
+# Costs: missing target values cannot be inferred and as it's a small percentage of 03%
+# They can be dropped
+n_cost_missing = cost_raw["Cost_USD_per_MWh"].isna().sum()
+cost_raw = cost_raw.dropna(subset=["Cost_USD_per_MWh"]).copy()
+print(f"\nDropped {n_cost_missing} rows with missing Cost_USD_per_MWh")
+
+# ------------------------------------------------------------
+# 5. PLANT PERFORMANCE METRIC (RMSE)
+# ------------------------------------------------------------
+# RMSE is used to quantify how far a plant's cost deviates
+# from the best possible cost across all demand scenarios.
+# This would allow to removed the plants that behave erratically
+# in terms of costs against different demand scenarios
+
+best_cost = (
+    cost_raw.groupby("Demand ID")["Cost_USD_per_MWh"]
+    .min()
+    .reset_index(name="Best_Cost")
+)
+
+eval_df = cost_raw.merge(best_cost, on="Demand ID", how="left")
+eval_df["Error"] = eval_df["Cost_USD_per_MWh"] - eval_df["Best_Cost"]
+
+rmse_df = (
+    eval_df.groupby("Plant ID")["Error"]
+    .apply(lambda x: np.sqrt(np.mean(x**2)))
+    .reset_index(name="RMSE")
+    .sort_values("RMSE")
+)
+
+rmse_df.to_csv("processed/plant_rmse_table.csv", index=False)
+
+print("\n=== RMSE Summary ===")
+print(rmse_df.describe())
+
+# ------------------------------------------------------------
+# 6. REMOVE WORST 25% PLANTS
+# ------------------------------------------------------------
+cutoff = rmse_df["RMSE"].quantile(0.75)
+
+rmse_df["Performance"] = np.where(
+    rmse_df["RMSE"] > cutoff,
+    "Worst 25% (Removed)",
+    "Retained"
+)
+
+worst_plants = rmse_df.loc[rmse_df["RMSE"] > cutoff, "Plant ID"]
+good_plants  = rmse_df.loc[rmse_df["RMSE"] <= cutoff, "Plant ID"]
+
+print(f"\nRMSE cutoff (75th percentile): {cutoff:.4f}")
+print(f"Plants removed: {len(worst_plants)}")
+print(f"Plants retained: {len(good_plants)}")
+
+# ------------------------------------------------------------
+# 7. PLANT PERFORMANCE VISUALIZATION
+# ------------------------------------------------------------
+plt.figure(figsize=(12, 5))
+sns.barplot(
+    data=rmse_df,
+    x="Plant ID",
+    y="RMSE",
+    hue="Performance",
+    palette={"Retained": "green", "Worst 25% (Removed)": "red"},
+    dodge=False
+)
+plt.xticks(rotation=90)
+plt.title("Plant RMSE Performance — Worst Quartile Removed")
+plt.tight_layout()
+plt.savefig("processed/plant_pruning_rmse.png", dpi=120)
+plt.show()
+
+plt.figure(figsize=(7, 4))
+sns.histplot(rmse_df["RMSE"], bins=15, kde=True)
+plt.axvline(cutoff, color="red", linestyle="--", linewidth=2, label="75% cutoff")
+plt.legend()
+plt.title("RMSE Distribution with Worst-Quartile Cutoff")
+plt.tight_layout()
+plt.savefig("processed/rmse_cutoff.png", dpi=120)
+plt.show()
+
+# ------------------------------------------------------------
+# 8. PRUNING APPLICATION
+# ------------------------------------------------------------
+pl_clean = pl_raw[pl_raw["Plant ID"].isin(good_plants)].copy()
+cost_clean = cost_raw[cost_raw["Plant ID"].isin(good_plants)].copy()
+
+print("\n=== DATA SHAPES AFTER PRUNING ===")
+print("Plants:", pl_raw.shape[0], "→", pl_clean.shape[0])
+print("Costs :", cost_raw.shape[0], "→", cost_clean.shape[0])
+
+# ------------------------------------------------------------
+# 9. OUTPUTS SAVED FOR STEP 2
+# ------------------------------------------------------------
+dem_raw.to_csv("processed/demand_clean.csv", index=False)
+pl_clean.to_csv("processed/plants_pruned.csv", index=False)
+cost_clean.to_csv("processed/generation_costs_pruned.csv", index=False)
+
+rmse_df.to_csv("processed/plant_rmse_full.csv", index=False)
+worst_plants.to_frame(name="Plant ID").to_csv("processed/removed_plants.csv", index=False)
+
+combined_pruned = (
+    cost_clean
+    .merge(dem_raw, on="Demand ID", how="left")
+    .merge(pl_clean, on="Plant ID", how="left")
+)
+
+combined_pruned.to_csv("processed/combined_pruned.csv", index=False)
+
+audit = pd.DataFrame({
+    "Dataset": ["Demand", "Plants (Pruned)", "Costs (Pruned)", "Combined"],
+    "Rows": [len(dem_raw), len(pl_clean), len(cost_clean), len(combined_pruned)],
+    "Columns": [dem_raw.shape[1], pl_clean.shape[1], cost_clean.shape[1], combined_pruned.shape[1]]
+})
+audit.to_csv("processed/step1_audit_summary.csv", index=False)
+
+print("\n✓ STEP 1 COMPLETE")
+print("Key output for Step 2 → processed/combined_pruned.csv")
+
+
+# In[ ]:
+
+
+# =============================================================================
+# STEP 2: EXPLORATORY DATA ANALYSIS (EDA)
+# =============================================================================
+# Covers:
+# 2.1 Demand feature distributions, correlations, outliers
+# 2.2 Cost analysis by plant type, region, day type
+# 2.3 Error distribution (Eq.1), RMSE per plant (Eq.2), ML motivation
+#
+# INPUT:
+#   processed/combined_pruned.csv
+#
+# OUTPUT:
+#   reports_step2/*.csv
+#   reports_step2/*.png
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy import stats
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+sns.set_style("whitegrid")
+plt.rcParams["figure.figsize"] = (10, 6)
+
+DATA_PATH = "processed/combined_pruned.csv"
+REPORT_DIR = "reports_step2"
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+# -----------------------------------------------------------------------------
+# LOAD DATA
+# -----------------------------------------------------------------------------
+combo = pd.read_csv(DATA_PATH)
+
+print("=== STEP 2 DATA LOADED ===")
+print("Shape:", combo.shape)
+
+# Identify columns
+cost_col = "Cost_USD_per_MWh"
+
+df_num = [c for c in combo.columns if c.startswith("DF") and pd.api.types.is_numeric_dtype(combo[c])]
+pf_num = [c for c in combo.columns if c.startswith("PF") and pd.api.types.is_numeric_dtype(combo[c])]
+
+df_region = "DF_region" if "DF_region" in combo.columns else None
+df_daytype = "DF_daytype" if "DF_daytype" in combo.columns else None
+plant_type = "Plant Type" if "Plant Type" in combo.columns else None
+plant_region = "Region" if "Region" in combo.columns else None
+
+# =============================================================================
+# 2.1 DEMAND FEATURE ANALYSIS
+# =============================================================================
+print("\n====================")
+print("2.1 DEMAND FEATURES")
+print("====================")
+
+# ---- 2.1.1 Summary statistics
+demand_stats = combo[df_num].describe().T.round(3)
+demand_stats.to_csv(os.path.join(REPORT_DIR, "2_1_demand_summary_statistics.csv"))
+print("\nDemand Feature Summary Statistics:")
+print(demand_stats)
+
+# ---- Distributions
+ncols = 4
+nrows = int(np.ceil(len(df_num) / ncols))
+fig, axes = plt.subplots(nrows, ncols, figsize=(16, nrows * 3))
+axes = axes.flatten()
+
+for i, col in enumerate(df_num):
+    sns.histplot(combo[col], bins=30, kde=True, ax=axes[i])
+    axes[i].set_title(col)
+for j in range(i + 1, len(axes)):
+    axes[j].axis("off")
+
+plt.suptitle("Demand Feature Distributions", fontweight="bold")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "2_1_demand_distributions.png"), dpi=140)
+plt.show()
+
+# ---- 2.1.2 Correlation heatmap
+corr = combo[df_num].corr()
+plt.figure(figsize=(12, 10))
+sns.heatmap(corr, cmap="coolwarm", center=0)
+plt.title("Demand Feature Correlation Heatmap", fontweight="bold")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "2_1_demand_correlation_heatmap.png"), dpi=140)
+plt.show()
+
+# ---- 2.1.3 Outlier detection (Z-score)
+z_scores = np.abs(stats.zscore(combo[df_num], nan_policy="omit"))
+outlier_mask = (z_scores > 3).any(axis=1)
+outliers = combo.loc[outlier_mask, ["Demand ID"] + df_num]
+outliers.to_csv(os.path.join(REPORT_DIR, "2_1_demand_outliers.csv"), index=False)
+
+print(f"\nOutlier demands detected: {len(outliers)} ({len(outliers)/len(combo)*100:.2f}%)")
+
+plt.figure(figsize=(14, 5))
+sns.boxplot(data=combo[df_num], orient="h")
+plt.title("Demand Feature Boxplots (Outliers Visible)", fontweight="bold")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "2_1_demand_boxplots.png"), dpi=140)
+plt.show()
+
+# =============================================================================
+# 2.2 COST ANALYSIS & DEMAND–PLANT COMBINATIONS
+# =============================================================================
+print("\n====================")
+print("2.2 COST ANALYSIS")
+print("====================")
+
+# ---- Overall cost stats
+cost_stats = combo[cost_col].describe().round(3)
+print("\nOverall Cost Statistics:")
+print(cost_stats)
+cost_stats.to_csv(os.path.join(REPORT_DIR, "2_2_cost_summary.csv"))
+
+# ---- Overall distribution
+plt.figure()
+sns.histplot(combo[cost_col], bins=50, kde=True)
+plt.axvline(combo[cost_col].mean(), color="red", linestyle="--", label="Mean")
+plt.axvline(combo[cost_col].median(), color="green", linestyle="--", label="Median")
+plt.legend()
+plt.title("Overall Cost Distribution", fontweight="bold")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "2_2_cost_distribution.png"), dpi=140)
+plt.show()
+
+# ---- Helper function for categorical cost analysis
+def cost_stats_and_plots(cat_col, label):
+    print(f"\nCost Statistics by {label}:")
+    tbl = combo.groupby(cat_col)[cost_col].agg(
+        ["count", "mean", "median", "std", "min", "max"]
+    ).round(3)
+    print(tbl)
+    tbl.to_csv(os.path.join(REPORT_DIR, f"2_2_cost_stats_by_{label.replace(' ', '_')}.csv"))
+
+    # Mean bar plot
+    plt.figure()
+    sns.barplot(x=tbl["mean"], y=tbl.index)
+    plt.xlabel("Average Cost (USD/MWh)")
+    plt.title(f"Average Cost by {label}", fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(os.path.join(REPORT_DIR, f"2_2_avg_cost_by_{label.replace(' ', '_')}.png"), dpi=140)
+    plt.show()
+
+    # Boxplot with mean marker
+    plt.figure()
+    sns.boxplot(
+        data=combo, x=cat_col, y=cost_col,
+        showmeans=True,
+        meanprops=dict(marker="D", markerfacecolor="black")
+    )
+    plt.xticks(rotation=30)
+    plt.title(f"Cost Distribution by {label}", fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(os.path.join(REPORT_DIR, f"2_2_cost_boxplot_by_{label.replace(' ', '_')}.png"), dpi=140)
+    plt.show()
+
+# ---- Apply categorical analysis
+if plant_type:
+    cost_stats_and_plots(plant_type, "Plant Type")
+if plant_region:
+    cost_stats_and_plots(plant_region, "Plant Region")
+if df_region:
+    cost_stats_and_plots(df_region, "Demand Region")
+if df_daytype:
+    cost_stats_and_plots(df_daytype, "Day Type")
+
+# ---- Best plant per demand
+best_per_demand = combo.loc[
+    combo.groupby("Demand ID")[cost_col].idxmin(),
+    ["Demand ID", "Plant ID", cost_col]
+]
+best_freq = best_per_demand["Plant ID"].value_counts().reset_index()
+best_freq.columns = ["Plant ID", "Times_Best"]
+best_freq["Percentage"] = (best_freq["Times_Best"] / best_freq["Times_Best"].sum() * 100).round(2)
+
+best_freq.to_csv(os.path.join(REPORT_DIR, "2_2_best_plant_frequency.csv"), index=False)
+
+plt.figure(figsize=(9, 5))
+sns.barplot(data=best_freq.head(10), x="Times_Best", y="Plant ID", color="green")
+plt.title("Top 10 Most Frequently Optimal Plants", fontweight="bold")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "2_2_best_plant_frequency.png"), dpi=140)
+plt.show()
+
+# =============================================================================
+# 2.3 ERROR DISTRIBUTION & RMSE (ML MOTIVATION)
+# =============================================================================
+print("\n====================")
+print("2.3 ERROR & RMSE")
+print("====================")
+
+# ---- Eq.1: Error(d,p)
+min_cost = combo.groupby("Demand ID")[cost_col].min().reset_index(name="Min_Cost")
+err_tbl = combo.merge(min_cost, on="Demand ID")
+err_tbl["Error"] = err_tbl[cost_col] - err_tbl["Min_Cost"]
+
+err_tbl.to_csv(os.path.join(REPORT_DIR, "2_3_errors_per_combination.csv"), index=False)
+
+plt.figure()
+sns.histplot(err_tbl["Error"], bins=50, kde=True)
+plt.title("Error Distribution (Eq. 1)", fontweight="bold")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "2_3_error_distribution.png"), dpi=140)
+plt.show()
+
+# ---- Eq.2: RMSE per plant
+rmse_tbl = (
+    err_tbl.groupby("Plant ID")["Error"]
+    .apply(lambda x: np.sqrt(np.mean(x**2)))
+    .reset_index(name="RMSE")
+    .sort_values("RMSE")
+)
+
+rmse_tbl.to_csv(os.path.join(REPORT_DIR, "2_3_rmse_per_plant.csv"), index=False)
+
+# ---- Colour-coded RMSE plot
+rmse_plot = rmse_tbl.copy()
+rmse_plot["Rank"] = range(1, len(rmse_plot) + 1)
+rmse_plot["Group"] = "Middle"
+rmse_plot.loc[rmse_plot["Rank"] <= 3, "Group"] = "Best"
+rmse_plot.loc[rmse_plot["Rank"] > len(rmse_plot) - 3, "Group"] = "Worst"
+
+palette = {"Best": "green", "Middle": "lightgray", "Worst": "red"}
+
+plt.figure(figsize=(10, 6))
+sns.barplot(
+    data=rmse_plot,
+    x="RMSE",
+    y="Plant ID",
+    hue="Group",
+    dodge=False,
+    palette=palette
+)
+plt.title("RMSE per Plant (Eq. 2)", fontweight="bold")
+plt.legend(title="Performance")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "2_3_rmse_per_plant_colored.png"), dpi=140)
+plt.show()
+
+# ---- ML motivation (printed summary)
+best_rmse = rmse_tbl.iloc[0]["RMSE"]
+median_rmse = rmse_tbl["RMSE"].median()
+worst_rmse = rmse_tbl.iloc[-1]["RMSE"]
+
+print("\n--- ML MOTIVATION SUMMARY ---")
+print(f"Best single plant RMSE : {best_rmse:.4f}")
+print(f"Median plant RMSE      : {median_rmse:.4f}")
+print(f"Worst plant RMSE       : {worst_rmse:.4f}")
+print("Theoretical optimal RMSE: 0.0000")
+print(
+    "Large RMSE variation across plants confirms that no single plant "
+    "is optimal for all demands, motivating ML-based demand-specific selection."
+)
+
+print("\n✓ STEP 2 COMPLETE — Outputs saved to:", REPORT_DIR)
+
+
+# In[ ]:
+
+
+# =============================================================================
+# STEP 3: MACHINE LEARNING MODEL TRAINING & EVALUATION
+# =============================================================================
+# Covers:
+# 3.1 Dataset preparation
+# 3.2 Grouped train/test split (Demand ID)
+# 3.3 Model training with preprocessing (scaling + encoding)
+# 3.4 Error (Eq.1) and RMSE (Eq.2)
+# 3.5 Comparison with Step 2 baseline
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+import joblib
+
+sns.set_style("whitegrid")
+
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
+DATA_PATH = "processed/combined_selected.csv"   # Output from Step 2b
+REPORT_DIR = "reports_step3"
+MODEL_DIR = "models_step3"
+
+os.makedirs(REPORT_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+N_TEST_DEMANDS = 20
+np.random.seed(RANDOM_SEED)
+
+# ----------------------------
+# 3.1 LOAD DATA
+# ----------------------------
+data = pd.read_csv(DATA_PATH)
+
+print("=== STEP 3 DATA LOADED ===")
+print("Dataset shape:", data.shape)
+print(data.head(3))
+
+# ----------------------------
+# IDENTIFY COLUMNS
+# ----------------------------
+target = "Cost_USD_per_MWh"
+group_col = "Demand ID"
+
+df_cols = [c for c in data.columns if c.startswith("DF")]
+pf_cols = [c for c in data.columns if c.startswith("PF")]
+numeric_cols = df_cols + pf_cols
+
+categorical_cols = [
+    c for c in ["DF_region", "DF_daytype", "Plant Type", "Region"]
+    if c in data.columns
+]
+
+print("\nNumeric features:", len(numeric_cols))
+print("Categorical features:", categorical_cols)
+
+# ----------------------------
+# 3.2 GROUPED TRAIN / TEST SPLIT (BY DEMAND ID)
+# ----------------------------
+unique_demands = data[group_col].unique()
+test_demands = np.random.choice(unique_demands, size=N_TEST_DEMANDS, replace=False)
+
+test_mask = data[group_col].isin(test_demands)
+train_mask = ~test_mask
+
+X_train = data.loc[train_mask, numeric_cols + categorical_cols]
+X_test  = data.loc[test_mask,  numeric_cols + categorical_cols]
+y_train = data.loc[train_mask, target]
+y_test  = data.loc[test_mask,  target]
+
+print("\nTrain rows:", X_train.shape[0])
+print("Test rows :", X_test.shape[0])
+
+# ----------------------------
+# 3.3 ML PIPELINE (SCALING + ENCODING)
+# ----------------------------
+numeric_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+# Handle sklearn version differences safely
+try:
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ])
+except TypeError:
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore", sparse=False))
+    ])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_pipe, numeric_cols),
+    ("cat", categorical_pipe, categorical_cols)
+])
+
+model = HistGradientBoostingRegressor(
+    random_state=RANDOM_SEED,
+    max_depth=10,
+    learning_rate=0.1,
+    max_iter=200
+)
+
+pipeline = Pipeline([
+    ("prep", preprocessor),
+    ("model", model)
+])
+
+# ----------------------------
+# TRAIN MODEL
+# ----------------------------
+pipeline.fit(X_train, y_train)
+
+print("\nModel trained.")
+print("Iterations used:", pipeline.named_steps["model"].n_iter_)
+
+joblib.dump(pipeline, os.path.join(MODEL_DIR, "ml_model.joblib"))
+
+# ----------------------------
+# 3.4 ERROR & RMSE CALCULATION (Eq. 1 & 2)
+# ----------------------------
+y_pred = pipeline.predict(X_test)
+
+results = data.loc[test_mask, ["Demand ID", "Plant ID", target]].copy()
+results["Predicted_Cost"] = y_pred
+
+errors = []
+
+for d in test_demands:
+    subset = results[results["Demand ID"] == d]
+
+    best_actual = subset[target].min()
+    selected_idx = subset["Predicted_Cost"].idxmin()
+    selected_cost = subset.loc[selected_idx, target]
+
+    error = best_actual - selected_cost
+    errors.append(error)
+
+errors = np.array(errors)
+rmse_ml = np.sqrt(np.mean(errors ** 2))
+
+print("\nML RMSE:", round(rmse_ml, 4))
+
+# ----------------------------
+# ACTUAL vs PREDICTED COST (VISUAL)
+# ----------------------------
+plt.figure(figsize=(7, 6))
+
+sns.scatterplot(
+    x=results["Predicted_Cost"],
+    y=results[target],
+    alpha=0.5
+)
+
+min_val = min(results["Predicted_Cost"].min(), results[target].min())
+max_val = max(results["Predicted_Cost"].max(), results[target].max())
+
+plt.plot(
+    [min_val, max_val],
+    [min_val, max_val],
+    color="red",
+    linestyle="--",
+    linewidth=2,
+    label="Perfect Prediction"
+)
+
+plt.xlabel("Predicted Cost (USD/MWh)")
+plt.ylabel("Actual Cost (USD/MWh)")
+plt.title("Actual vs Predicted Cost (Test Set)")
+plt.legend()
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(REPORT_DIR, "actual_vs_predicted_cost.png"),
+    dpi=140
+)
+plt.show()
+
+# ----------------------------
+# 3.5 BASELINE COMPARISON (STEP 2.3)
+# ----------------------------
+baseline = pd.read_csv("reports_step2/2_3_2_rmse_per_plant.csv")
+
+best_rmse = baseline["RMSE"].min()
+median_rmse = baseline["RMSE"].median()
+worst_rmse = baseline["RMSE"].max()
+
+best_plant = baseline.loc[baseline["RMSE"].idxmin(), "Plant ID"]
+worst_plant = baseline.loc[baseline["RMSE"].idxmax(), "Plant ID"]
+
+comparison = pd.DataFrame({
+    "Strategy": [
+        "ML Model",
+        f"Best Single Plant ({best_plant})",
+        "Median Plant",
+        f"Worst Single Plant ({worst_plant})"
+    ],
+    "RMSE": [rmse_ml, best_rmse, median_rmse, worst_rmse]
+})
+
+comparison["Improvement_vs_ML"] = comparison["RMSE"] - rmse_ml
+comparison.to_csv(os.path.join(REPORT_DIR, "rmse_comparison.csv"), index=False)
+
+print("\n=== RMSE COMPARISON ===")
+print(comparison)
+
+plt.figure(figsize=(8, 5))
+sns.barplot(data=comparison, x="RMSE", y="Strategy")
+plt.axvline(rmse_ml, color="red", linestyle="--", label="ML RMSE")
+plt.legend()
+plt.title("RMSE Comparison: ML vs Baselines")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "rmse_comparison.png"), dpi=140)
+plt.show()
+
+# ----------------------------
+# ERROR DISTRIBUTION (Eq. 1)
+# ----------------------------
+plt.figure(figsize=(8, 4))
+sns.histplot(errors, bins=20, kde=True)
+plt.axvline(0, color="black", linestyle="--")
+plt.title("Distribution of Errors (Equation 1)")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "error_distribution.png"), dpi=140)
+plt.show()
+
+# ----------------------------
+# SUMMARY (PRINT-BASED, MARKER FRIENDLY)
+# ----------------------------
+print("\n=== STEP 3 SUMMARY ===")
+print(f"ML RMSE: {rmse_ml:.4f}")
+print(f"Best single plant RMSE: {best_rmse:.4f}")
+print(f"Improvement vs best plant: {best_rmse - rmse_ml:.4f}")
+
+print("\n✓ STEP 3 COMPLETE")
+print("Outputs saved to:", REPORT_DIR)
+
+
+# In[ ]:
+
+
+# =============================================================================
+# STEP 3: MACHINE LEARNING MODEL TRAINING & EVALUATION
+# =============================================================================
+# Covers:
+# 3.1 Dataset preparation
+# 3.2 Grouped train/test split (Demand ID)
+# 3.3 Model training with preprocessing (scaling + encoding)
+# 3.4 Error (Eq.1) and RMSE (Eq.2)
+# 3.5 Comparison with Step 2 baseline
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+import joblib
+
+sns.set_style("whitegrid")
+
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
+DATA_PATH = "processed/combined_selected.csv"   # Output from Step 2b
+REPORT_DIR = "reports_step3"
+MODEL_DIR = "models_step3"
+
+os.makedirs(REPORT_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+N_TEST_DEMANDS = 20
+np.random.seed(RANDOM_SEED)
+
+# ----------------------------
+# 3.1 LOAD DATA
+# ----------------------------
+data = pd.read_csv(DATA_PATH)
+
+print("=== STEP 3 DATA LOADED ===")
+print("Dataset shape:", data.shape)
+print(data.head(3))
+
+# ----------------------------
+# IDENTIFY COLUMNS
+# ----------------------------
+target = "Cost_USD_per_MWh"
+group_col = "Demand ID"
+
+df_cols = [c for c in data.columns if c.startswith("DF")]
+pf_cols = [c for c in data.columns if c.startswith("PF")]
+numeric_cols = df_cols + pf_cols
+
+categorical_cols = [
+    c for c in ["DF_region", "DF_daytype", "Plant Type", "Region"]
+    if c in data.columns
+]
+
+print("\nNumeric features:", len(numeric_cols))
+print("Categorical features:", categorical_cols)
+
+# ----------------------------
+# 3.2 GROUPED TRAIN / TEST SPLIT (BY DEMAND ID)
+# ----------------------------
+unique_demands = data[group_col].unique()
+test_demands = np.random.choice(unique_demands, size=N_TEST_DEMANDS, replace=False)
+
+test_mask = data[group_col].isin(test_demands)
+train_mask = ~test_mask
+
+X_train = data.loc[train_mask, numeric_cols + categorical_cols]
+X_test  = data.loc[test_mask,  numeric_cols + categorical_cols]
+y_train = data.loc[train_mask, target]
+y_test  = data.loc[test_mask,  target]
+
+print("\nTrain rows:", X_train.shape[0])
+print("Test rows :", X_test.shape[0])
+
+# ----------------------------
+# 3.3 ML PIPELINE (SCALING + ENCODING)
+# ----------------------------
+numeric_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+# Handle sklearn version differences safely
+try:
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ])
+except TypeError:
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore", sparse=False))
+    ])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_pipe, numeric_cols),
+    ("cat", categorical_pipe, categorical_cols)
+])
+
+model = HistGradientBoostingRegressor(
+    random_state=RANDOM_SEED,
+    max_depth=10,
+    learning_rate=0.1,
+    max_iter=200
+)
+
+pipeline = Pipeline([
+    ("prep", preprocessor),
+    ("model", model)
+])
+
+# ----------------------------
+# TRAIN MODEL
+# ----------------------------
+pipeline.fit(X_train, y_train)
+
+print("\nModel trained.")
+print("Iterations used:", pipeline.named_steps["model"].n_iter_)
+
+joblib.dump(pipeline, os.path.join(MODEL_DIR, "ml_model.joblib"))
+
+# ----------------------------
+# 3.4 ERROR & RMSE CALCULATION (Eq. 1 & 2)
+# ----------------------------
+y_pred = pipeline.predict(X_test)
+
+results = data.loc[test_mask, ["Demand ID", "Plant ID", target]].copy()
+results["Predicted_Cost"] = y_pred
+
+errors = []
+
+for d in test_demands:
+    subset = results[results["Demand ID"] == d]
+
+    best_actual = subset[target].min()
+    selected_idx = subset["Predicted_Cost"].idxmin()
+    selected_cost = subset.loc[selected_idx, target]
+
+    error = best_actual - selected_cost
+    errors.append(error)
+
+errors = np.array(errors)
+rmse_ml = np.sqrt(np.mean(errors ** 2))
+
+print("\nML RMSE:", round(rmse_ml, 4))
+
+# ----------------------------
+# ACTUAL vs PREDICTED COST (VISUAL)
+# ----------------------------
+plt.figure(figsize=(7, 6))
+
+sns.scatterplot(
+    x=results["Predicted_Cost"],
+    y=results[target],
+    alpha=0.5
+)
+
+min_val = min(results["Predicted_Cost"].min(), results[target].min())
+max_val = max(results["Predicted_Cost"].max(), results[target].max())
+
+plt.plot(
+    [min_val, max_val],
+    [min_val, max_val],
+    color="red",
+    linestyle="--",
+    linewidth=2,
+    label="Perfect Prediction"
+)
+
+plt.xlabel("Predicted Cost (USD/MWh)")
+plt.ylabel("Actual Cost (USD/MWh)")
+plt.title("Actual vs Predicted Cost (Test Set)")
+plt.legend()
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(REPORT_DIR, "actual_vs_predicted_cost.png"),
+    dpi=140
+)
+plt.show()
+
+# ----------------------------
+# 3.5 BASELINE COMPARISON (STEP 2.3)
+# ----------------------------
+baseline = pd.read_csv("reports_step2/2_3_2_rmse_per_plant.csv")
+
+best_rmse = baseline["RMSE"].min()
+median_rmse = baseline["RMSE"].median()
+worst_rmse = baseline["RMSE"].max()
+
+best_plant = baseline.loc[baseline["RMSE"].idxmin(), "Plant ID"]
+worst_plant = baseline.loc[baseline["RMSE"].idxmax(), "Plant ID"]
+
+comparison = pd.DataFrame({
+    "Strategy": [
+        "ML Model",
+        f"Best Single Plant ({best_plant})",
+        "Median Plant",
+        f"Worst Single Plant ({worst_plant})"
+    ],
+    "RMSE": [rmse_ml, best_rmse, median_rmse, worst_rmse]
+})
+
+comparison["Improvement_vs_ML"] = comparison["RMSE"] - rmse_ml
+comparison.to_csv(os.path.join(REPORT_DIR, "rmse_comparison.csv"), index=False)
+
+print("\n=== RMSE COMPARISON ===")
+print(comparison)
+
+plt.figure(figsize=(8, 5))
+sns.barplot(data=comparison, x="RMSE", y="Strategy")
+plt.axvline(rmse_ml, color="red", linestyle="--", label="ML RMSE")
+plt.legend()
+plt.title("RMSE Comparison: ML vs Baselines")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "rmse_comparison.png"), dpi=140)
+plt.show()
+
+# ----------------------------
+# ERROR DISTRIBUTION (Eq. 1)
+# ----------------------------
+plt.figure(figsize=(8, 4))
+sns.histplot(errors, bins=20, kde=True)
+plt.axvline(0, color="black", linestyle="--")
+plt.title("Distribution of Errors (Equation 1)")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "error_distribution.png"), dpi=140)
+plt.show()
+
+# ----------------------------
+# SUMMARY (PRINT-BASED, MARKER FRIENDLY)
+# ----------------------------
+print("\n=== STEP 3 SUMMARY ===")
+print(f"ML RMSE: {rmse_ml:.4f}")
+print(f"Best single plant RMSE: {best_rmse:.4f}")
+print(f"Improvement vs best plant: {best_rmse - rmse_ml:.4f}")
+
+print("\n✓ STEP 3 COMPLETE")
+print("Outputs saved to:", REPORT_DIR)
+
+
+# In[ ]:
+
+
+# =============================================================================
+# STEP 5: HYPERPARAMETER OPTIMISATION (LOGO CV)
+# =============================================================================
+# Uses:
+# - Same 100 Demand ID groups as Step 4
+# - Leave-One-Group-Out CV
+# - Custom scorer (Eq.1)
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import LeaveOneGroupOut, ParameterGrid
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+sns.set_style("whitegrid")
+
+# ---------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------
+DATA_PATH = "processed/combined_selected.csv"
+REPORT_DIR = "reports_step5"
+
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+N_GROUPS = 100
+np.random.seed(RANDOM_SEED)
+
+# ---------------------------------------------------------------------
+# LOAD DATA
+# ---------------------------------------------------------------------
+data = pd.read_csv(DATA_PATH)
+
+target = "Cost_USD_per_MWh"
+group_col = "Demand ID"
+
+df_cols = [c for c in data.columns if c.startswith("DF")]
+pf_cols = [c for c in data.columns if c.startswith("PF")]
+numeric_cols = df_cols + pf_cols
+
+print("Dataset shape:", data.shape)
+print("Numeric features:", len(numeric_cols))
+
+# ---------------------------------------------------------------------
+# SELECT SAME 100 DEMAND GROUPS AS STEP 4
+# ---------------------------------------------------------------------
+unique_demands = data[group_col].unique()
+selected_demands = np.random.choice(unique_demands, size=N_GROUPS, replace=False)
+
+mask = data[group_col].isin(selected_demands)
+data_cv = data.loc[mask].copy()
+
+X_all = data_cv[numeric_cols]
+y_all = data_cv[target]
+groups = data_cv[group_col]
+
+print("\nLOGO CV setup:")
+print("Rows:", X_all.shape[0])
+print("Unique Demand IDs:", groups.nunique())
+
+# ---------------------------------------------------------------------
+# CUSTOM SCORER (Eq.1)
+# ---------------------------------------------------------------------
+def eq1_rmse(estimator, X, y, demand_ids):
+    preds = estimator.predict(X)
+    df = pd.DataFrame({
+        "Demand ID": demand_ids.values,
+        "Actual": y.values,
+        "Predicted": preds
+    })
+
+    errors = []
+    for d in df["Demand ID"].unique():
+        sub = df[df["Demand ID"] == d]
+        best_actual = sub["Actual"].min()
+        selected_actual = sub.loc[sub["Predicted"].idxmin(), "Actual"]
+        errors.append(best_actual - selected_actual)
+
+    return np.sqrt(np.mean(np.array(errors) ** 2))
+
+# ---------------------------------------------------------------------
+# PIPELINE (NUMERIC ONLY — AS PER STEP 3)
+# ---------------------------------------------------------------------
+preprocessor = ColumnTransformer([
+    ("num", Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ]), numeric_cols)
+])
+
+# ---------------------------------------------------------------------
+# PARAMETER GRID (OPTIMISED FOR TIME)
+# ---------------------------------------------------------------------
+param_grid = {
+    "learning_rate": [0.05, 0.1],
+    "max_depth": [6, 10],
+    "max_iter": [150, 250],
+    "min_samples_leaf": [30, 60],
+    "l2_regularization": [0.0, 0.1]
+}
+
+grid = list(ParameterGrid(param_grid))
+print(f"\nTotal parameter combinations: {len(grid)}")
+
+# ---------------------------------------------------------------------
+# LOGO CV
+# ---------------------------------------------------------------------
+logo = LeaveOneGroupOut()
+
+results = []
+
+for i, params in enumerate(grid, 1):
+    model = HistGradientBoostingRegressor(
+        random_state=RANDOM_SEED,
+        **params
+    )
+
+    pipeline = Pipeline([
+        ("prep", preprocessor),
+        ("model", model)
+    ])
+
+    fold_rmses = []
+
+    for train_idx, test_idx in logo.split(X_all, y_all, groups):
+        X_tr, X_te = X_all.iloc[train_idx], X_all.iloc[test_idx]
+        y_tr, y_te = y_all.iloc[train_idx], y_all.iloc[test_idx]
+        g_te = groups.iloc[test_idx]
+
+        pipeline.fit(X_tr, y_tr)
+        rmse = eq1_rmse(pipeline, X_te, y_te, g_te)
+        fold_rmses.append(rmse)
+
+    mean_rmse = np.mean(fold_rmses)
+
+    results.append({
+        **params,
+        "mean_rmse": mean_rmse
+    })
+
+    print(f"[{i}/{len(grid)}] RMSE = {mean_rmse:.4f}")
+
+# ---------------------------------------------------------------------
+# RESULTS
+# ---------------------------------------------------------------------
+results_df = pd.DataFrame(results).sort_values("mean_rmse")
+results_df.to_csv(os.path.join(REPORT_DIR, "step5_grid_results.csv"), index=False)
+
+best = results_df.iloc[0]
+
+print("\n=== STEP 5 RESULTS ===")
+print("Best LOGO CV RMSE:", round(best["mean_rmse"], 4))
+print("Best parameters:")
+for k, v in best.items():
+    if k != "mean_rmse":
+        print(f"  {k}: {v}")
+
+# ---------------------------------------------------------------------
+# VISUALISATION
+# ---------------------------------------------------------------------
+plt.figure(figsize=(8, 5))
+sns.histplot(results_df["mean_rmse"], bins=15, kde=True)
+plt.axvline(best["mean_rmse"], color="red", linestyle="--", label="Best")
+plt.legend()
+plt.title("Distribution of LOGO CV RMSE (Step 5)")
+plt.tight_layout()
+plt.savefig(os.path.join(REPORT_DIR, "rmse_distribution_step5.png"), dpi=140)
+plt.show()
+
+print("\n✓ STEP 5 COMPLETE")
+print("Outputs saved to:", REPORT_DIR)
+
+
+# In[ ]:
+
+
+# =============================================================================
+# STEP 6A: ALTERNATIVE MODEL — RANDOM FOREST REGRESSOR
+# =============================================================================
+# Mirrors Step 3 exactly, replacing HistGradientBoosting with RandomForest
+#
+# Covers:
+# 6.1 Alternative model selection & training
+# 6.2 Evaluation using Eq.1 & Eq.2
+# 6.3 Visual diagnostics (Actual vs Predicted)
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score
+
+import joblib
+
+sns.set_style("whitegrid")
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+DATA_PATH = "processed/combined_selected.csv"   # Output from Step 2b
+REPORT_DIR = "reports_step6"
+MODEL_DIR = "models_step6"
+
+os.makedirs(REPORT_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+N_TEST_DEMANDS = 20
+np.random.seed(RANDOM_SEED)
+
+# -----------------------------------------------------------------------------
+# 6A.1 LOAD DATA
+# -----------------------------------------------------------------------------
+data = pd.read_csv(DATA_PATH)
+
+print("=== STEP 6A DATA LOADED ===")
+print("Dataset shape:", data.shape)
+
+# -----------------------------------------------------------------------------
+# IDENTIFY COLUMNS
+# -----------------------------------------------------------------------------
+target = "Cost_USD_per_MWh"
+group_col = "Demand ID"
+
+df_cols = [c for c in data.columns if c.startswith("DF")]
+pf_cols = [c for c in data.columns if c.startswith("PF")]
+numeric_cols = df_cols + pf_cols
+
+print("\nNumeric features used:", len(numeric_cols))
+
+# -----------------------------------------------------------------------------
+# 6A.2 GROUPED TRAIN / TEST SPLIT (Demand ID)
+# -----------------------------------------------------------------------------
+unique_demands = data[group_col].unique()
+test_demands = np.random.choice(unique_demands, size=N_TEST_DEMANDS, replace=False)
+
+test_mask = data[group_col].isin(test_demands)
+train_mask = ~test_mask
+
+X_train = data.loc[train_mask, numeric_cols]
+X_test  = data.loc[test_mask,  numeric_cols]
+y_train = data.loc[train_mask, target]
+y_test  = data.loc[test_mask,  target]
+
+print("\nTrain rows:", X_train.shape[0])
+print("Test rows :", X_test.shape[0])
+
+# -----------------------------------------------------------------------------
+# 6A.3 PREPROCESSING + RANDOM FOREST PIPELINE
+# -----------------------------------------------------------------------------
+numeric_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_pipe, numeric_cols)
+])
+
+rf_model = RandomForestRegressor(
+    n_estimators=300,
+    max_depth=15,
+    min_samples_leaf=20,
+    random_state=RANDOM_SEED,
+    n_jobs=-1
+)
+
+pipeline = Pipeline([
+    ("prep", preprocessor),
+    ("model", rf_model)
+])
+
+# -----------------------------------------------------------------------------
+# TRAIN MODEL
+# -----------------------------------------------------------------------------
+pipeline.fit(X_train, y_train)
+
+joblib.dump(pipeline, os.path.join(MODEL_DIR, "random_forest_model.joblib"))
+
+print("\nRandom Forest model trained.")
+
+# -----------------------------------------------------------------------------
+# 6A.4 ERROR (Eq.1) & RMSE (Eq.2)
+# -----------------------------------------------------------------------------
+y_pred = pipeline.predict(X_test)
+
+results = data.loc[test_mask, ["Demand ID", "Plant ID", target]].copy()
+results["Predicted_Cost"] = y_pred
+
+errors = []
+
+for d in test_demands:
+    subset = results[results["Demand ID"] == d]
+
+    best_actual = subset[target].min()
+    selected_idx = subset["Predicted_Cost"].idxmin()
+    selected_cost = subset.loc[selected_idx, target]
+
+    error = best_actual - selected_cost
+    errors.append(error)
+
+errors = np.array(errors)
+
+rmse_rf = np.sqrt(np.mean(errors ** 2))
+r2_rf = r2_score(y_test, y_pred)
+
+print("\n=== RANDOM FOREST PERFORMANCE ===")
+print(f"RMSE (Eq.2): {rmse_rf:.4f}")
+print(f"R² Score  : {r2_rf:.4f}")
+
+# -----------------------------------------------------------------------------
+# 6A.5 ACTUAL vs PREDICTED COST VISUALISATION
+# -----------------------------------------------------------------------------
+plt.figure(figsize=(7, 6))
+sns.scatterplot(
+    x=results["Predicted_Cost"],
+    y=results[target],
+    alpha=0.5
+)
+
+min_val = min(results["Predicted_Cost"].min(), results[target].min())
+max_val = max(results["Predicted_Cost"].max(), results[target].max())
+
+plt.plot(
+    [min_val, max_val],
+    [min_val, max_val],
+    linestyle="--",
+    color="red",
+    linewidth=2,
+    label="Perfect Prediction"
+)
+
+plt.xlabel("Predicted Cost (USD/MWh)")
+plt.ylabel("Actual Cost (USD/MWh)")
+plt.title("Step 6A: Random Forest — Actual vs Predicted Cost")
+plt.legend()
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(REPORT_DIR, "rf_actual_vs_predicted.png"),
+    dpi=140
+)
+plt.show()
+
+# -----------------------------------------------------------------------------
+# SAVE METRICS
+# -----------------------------------------------------------------------------
+summary = pd.DataFrame({
+    "Model": ["Random Forest"],
+    "RMSE": [rmse_rf],
+    "R2": [r2_rf],
+    "Test_Demands": [N_TEST_DEMANDS]
+})
+
+summary.to_csv(os.path.join(REPORT_DIR, "step6_rf_summary.csv"), index=False)
+
+# -----------------------------------------------------------------------------
+# SUMMARY
+# -----------------------------------------------------------------------------
+print("\n=== STEP 6A SUMMARY ===")
+print(summary)
+
+print("\n✓ STEP 6A COMPLETE — Random Forest baseline established")
+print("Reports saved to:", REPORT_DIR)
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
