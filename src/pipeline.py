@@ -18,6 +18,8 @@ from .config import Config, load_config, save_effective_config
 from .preprocessor import NECPreprocessor
 from .evaluation import Evaluator
 from .visualizations import Visualizer
+from .models import ModelFactory
+from .scorer import calculate_error_statistics
 
 
 # Setup logging
@@ -179,7 +181,84 @@ class NECPipeline:
     
     def _train_baseline_model(self):
         """Stage 4: Train and evaluate baseline model"""
+        self.logger.info("\n" + "="*80)
+        self.logger.info("STAGE 4: BASELINE MODEL TRAINING & EVALUATION")
+        self.logger.info("="*80)
         
+        # Validate preprocessor is initialized and fitted
+        assert self.preprocessor is not None, "Preprocessor must be initialized before training baseline model"
+        assert self.preprocessor.demand_features_ is not None, "Preprocessor demand_features_ must be fitted before training baseline model"
+        assert self.preprocessor.plant_features_ is not None, "Preprocessor plant_features_ must be fitted before training baseline model"
+        assert self.combined_df is not None, "Combined dataset must be created before training baseline model"
+        
+        # Create model with default parameters
+        model_class = ModelFactory.create_model(
+            self.config.model_type,
+            self.config.model_params,
+            self.config.random_seed
+        ).__class__
+        
+        # Grouped train/test split
+        X_train, X_test, y_train, y_test, test_demand_ids, combined_df_test = self.evaluator.grouped_train_test_split(
+                self.combined_df,
+                self.config.test_size_percent,
+                self.preprocessor.demand_features_,
+                self.preprocessor.plant_features_
+            )
+        
+        # Train baseline model
+        self.logger.info("Training baseline model...")
+        baseline_model = ModelFactory.create_model(
+            self.config.model_type,
+            self.config.model_params,
+            self.config.random_seed
+        )
+        baseline_model.fit(X_train, y_train)
+        
+        # Evaluate on test set
+        test_errors, test_stats, scenario_table = self.evaluator.evaluate_on_test_set(
+            baseline_model,
+            X_test,
+            y_test,
+            combined_df_test,
+            self.preprocessor.demand_features_,
+            self.preprocessor.plant_features_
+        )
+        
+        # LOGO Cross-Validation
+        self.logger.info("\nPerforming LOGO Cross-Validation (baseline model)...")
+        logo_errors, logo_fold_results = self.evaluator.logo_cross_validation(
+            model_class,
+            self.config.model_params,
+            self.combined_df,
+            self.preprocessor.demand_features_,
+            self.preprocessor.plant_features_,
+            n_folds=self.config.cv_n_folds,
+            n_jobs=self.config.cv_n_jobs
+        )
+        
+        logo_stats = calculate_error_statistics(np.array(logo_errors))
+        
+        # Store baseline results
+        self.baseline_results = {
+            'model': baseline_model,
+            'params': self.config.model_params,
+            'test_errors': test_errors,
+            'test_stats': test_stats,
+            'scenario_table': scenario_table,
+            'logo_errors': logo_errors,
+            'logo_stats': logo_stats,
+            'logo_fold_results': logo_fold_results,
+            'X_train': X_train,
+            'X_test': X_test,
+            'y_train': y_train,
+            'y_test': y_test,
+            'combined_df_test': combined_df_test
+        }
+        
+        self.logger.info(f"\nBaseline Model Results:")
+        self.logger.info(f"  - Test Set RMSE: ${test_stats['rmse']:.2f}/MWh")
+        self.logger.info(f"  - LOGO CV RMSE: ${logo_stats['rmse']:.2f}/MWh")
     
     def _optimize_hyperparameters(self):
         """Stage 5: Hyperparameter optimization"""

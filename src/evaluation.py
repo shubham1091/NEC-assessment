@@ -221,7 +221,8 @@ class Evaluator:
         all_features = demand_features + plant_features
         X = combined_df[all_features].to_numpy(dtype=np.float64)
         y = combined_df['Cost'].to_numpy(dtype=np.float64)
-        groups = combined_df['Demand_ID'].to_numpy(dtype=np.int64, copy=False)
+        # Extract numeric part from Demand_ID (e.g., 'D1' -> 1)
+        groups = np.asarray(combined_df['Demand_ID'].str.extract('(\d+)')[0].astype(np.int64).values, dtype=np.int64)
         
         logo = LeaveOneGroupOut()
         all_splits = list(logo.split(X, y, groups))
