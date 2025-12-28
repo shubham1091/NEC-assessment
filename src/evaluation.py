@@ -14,6 +14,12 @@ class Evaluator:
     """Handles model evaluation with grouped train/test and LOGO CV"""
     
     def __init__(self, random_seed: int = 7042025):
+        """
+        Initialize evaluator.
+        
+        Args:
+            random_seed: Random seed for reproducibility
+        """
         self.random_seed = random_seed
     
     def create_combined_dataset(self,
@@ -22,7 +28,19 @@ class Evaluator:
                                 costs_df: pd.DataFrame,
                                 demand_features: List[str],
                                 plant_features: List[str]) -> pd.DataFrame:
+        """
+        Create combined dataset with demand+plant features and costs.
         
+        Args:
+            demand_df: Demand data (scaled)
+            plants_df: Plant data (scaled)
+            costs_df: Cost data (filtered)
+            demand_features: List of demand feature column names
+            plant_features: List of plant feature column names
+            
+        Returns:
+            Combined DataFrame with all features and cost
+        """
         logger.info("Creating combined dataset...")
         
         combined_data = []
@@ -63,7 +81,18 @@ class Evaluator:
                                  test_size_percent: float,
                                  demand_features: List[str],
                                  plant_features: List[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, set, pd.DataFrame]:
+        """
+        Perform grouped train/test split by Demand ID.
         
+        Args:
+            combined_df: Combined dataset
+            test_size_percent: Percentage of demands for test set
+            demand_features: List of demand features
+            plant_features: List of plant features
+            
+        Returns:
+            Tuple of (X_train, X_test, y_train, y_test, test_demand_ids, combined_df_test)
+        """
         logger.info(f"Performing grouped train/test split (test size: {test_size_percent}%)...")
         
         all_features = demand_features + plant_features
@@ -93,7 +122,20 @@ class Evaluator:
                             combined_df_test: pd.DataFrame,
                             demand_features: List[str],
                             plant_features: List[str]) -> Tuple[np.ndarray, Dict[str, Any], pd.DataFrame]:
+        """
+        Evaluate model on held-out test set and generate per-scenario selection table.
         
+        Args:
+            model: Fitted model
+            X_test: Test features
+            y_test: Test costs
+            combined_df_test: Test set DataFrame
+            demand_features: List of demand features
+            plant_features: List of plant features
+            
+        Returns:
+            Tuple of (errors, error_stats, scenario_table)
+        """
         logger.info("Evaluating on test set...")
         
         y_pred = model.predict(X_test)
@@ -157,7 +199,23 @@ class Evaluator:
                              plant_features: List[str],
                              n_folds: int = 500,
                              n_jobs: int = -1) -> Tuple[List[float], pd.DataFrame]:
+        """
+        Perform Leave-One-Group-Out cross-validation.
         
+        Each fold leaves out one demand (all its plant combinations) for testing.
+        
+        Args:
+            model_class: Model class (not instance)
+            model_params: Model hyperparameters
+            combined_df: Combined dataset
+            demand_features: List of demand features
+            plant_features: List of plant features
+            n_folds: Number of folds to use (max = number of unique demands)
+            n_jobs: Number of parallel jobs
+            
+        Returns:
+            Tuple of (fold_errors, fold_results_df)
+        """
         logger.info(f"Performing LOGO cross-validation ({n_folds} folds)...")
         
         all_features = demand_features + plant_features
