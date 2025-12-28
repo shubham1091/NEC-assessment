@@ -20,6 +20,7 @@ from .evaluation import Evaluator
 from .visualizations import Visualizer
 from .models import ModelFactory
 from .scorer import calculate_error_statistics
+from .optimization import HyperparameterOptimizer
 
 
 # Setup logging
@@ -62,7 +63,7 @@ class NECPipeline:
         self.preprocessor = None
         self.model = None
         self.evaluator = Evaluator(random_seed=config.random_seed)
-        self.optimizer = None
+        self.optimizer = HyperparameterOptimizer(random_seed=config.random_seed)
         
         # Results storage
         self.demand_df = None
@@ -262,7 +263,89 @@ class NECPipeline:
     
     def _optimize_hyperparameters(self):
         """Stage 5: Hyperparameter optimization"""
+        self.logger.info("\n" + "="*80)
+        self.logger.info("STAGE 5: HYPERPARAMETER OPTIMIZATION")
+        self.logger.info("="*80)
         
+        # Validate preprocessor is initialized and fitted
+        assert self.preprocessor is not None, "Preprocessor must be initialized before training baseline model"
+        assert self.preprocessor.demand_features_ is not None, "Preprocessor demand_features_ must be fitted before training baseline model"
+        assert self.preprocessor.plant_features_ is not None, "Preprocessor plant_features_ must be fitted before training baseline model"
+        assert self.combined_df is not None, "Combined dataset must be created before training baseline model"
+        
+        model_class = ModelFactory.create_model(
+            self.config.model_type,
+            self.config.model_params,
+            self.config.random_seed
+        ).__class__
+        
+        best_params, best_rmse, leaderboard = self.optimizer.optimize(
+            model_class,
+            self.config.tuning_grid,
+            self.combined_df,
+            self.preprocessor.demand_features_,
+            self.preprocessor.plant_features_,
+            n_cv_folds=self.config.hyperparam_cv_folds
+        )
+        
+        # Train optimized model on full training set and evaluate
+        self.logger.info("\nTraining optimized model on full training set...")
+        optimized_model = ModelFactory.create_model(
+            self.config.model_type,
+            best_params,
+            self.config.random_seed
+        )
+        optimized_model.fit(
+            self.baseline_results['X_train'],
+            self.baseline_results['y_train']
+        )
+        
+        # Evaluate optimized model
+        opt_test_errors, opt_test_stats, opt_scenario_table = self.evaluator.evaluate_on_test_set(
+            optimized_model,
+            self.baseline_results['X_test'],
+            self.baseline_results['y_test'],
+            self.baseline_results['combined_df_test'],
+            self.preprocessor.demand_features_,
+            self.preprocessor.plant_features_
+        )
+        
+        # LOGO CV for optimized model
+        self.logger.info("\nPerforming LOGO Cross-Validation (optimized model)...")
+        opt_logo_errors, opt_logo_fold_results = self.evaluator.logo_cross_validation(
+            model_class,
+            best_params,
+            self.combined_df,
+            self.preprocessor.demand_features_,
+            self.preprocessor.plant_features_,
+            n_folds=self.config.cv_n_folds,
+            n_jobs=self.config.cv_n_jobs
+        )
+        
+        opt_logo_stats = calculate_error_statistics(np.array(opt_logo_errors))
+        
+        # Store optimized results
+        self.optimized_results = {
+            'model': optimized_model,
+            'params': best_params,
+            'test_errors': opt_test_errors,
+            'test_stats': opt_test_stats,
+            'scenario_table': opt_scenario_table,
+            'logo_errors': opt_logo_errors,
+            'logo_stats': opt_logo_stats,
+            'logo_fold_results': opt_logo_fold_results,
+            'leaderboard': leaderboard,
+            'best_rmse': best_rmse
+        }
+        
+        improvement = ((self.baseline_results['test_stats']['rmse'] - opt_test_stats['rmse']) / 
+                      self.baseline_results['test_stats']['rmse'] * 100)
+        
+        self.logger.info(f"\nOptimized Model Results:")
+        self.logger.info(f"  - Best Parameters: {best_params}")
+        self.logger.info(f"  - Test Set RMSE: ${opt_test_stats['rmse']:.2f}/MWh")
+        self.logger.info(f"  - LOGO CV RMSE: ${opt_logo_stats['rmse']:.2f}/MWh")
+        self.logger.info(f"  - Improvement over baseline: {improvement:.2f}%")
     
     def _train_final_model(self):
         """Stage 6: Train final model with best parameters"""
