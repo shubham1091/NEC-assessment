@@ -17,6 +17,7 @@ from typing import Dict, Any
 from .config import Config, load_config, save_effective_config
 from .preprocessor import NECPreprocessor
 from .evaluation import Evaluator
+from .visualizations import Visualizer
 
 
 # Setup logging
@@ -194,4 +195,17 @@ class NECPipeline:
     
     def _generate_visualizations(self):
         """Stage 8: Generate EDA and results visualizations"""
+        self.logger.info("\n" + "="*80)
+        self.logger.info("STAGE 8: GENERATING VISUALIZATIONS")
+        self.logger.info("="*80)
+        
+        # Create visualizer
+        viz = Visualizer(output_dir=f"{self.config.results_dir}/plots")
+        
+
+        
+        viz.plot_cost_distribution(self.costs_df)
+        viz.plot_plant_performance(self.costs_df)
+        
+        
         
