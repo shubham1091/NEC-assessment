@@ -509,13 +509,30 @@ class NECPipeline:
         self.logger.info("STAGE 8: GENERATING VISUALIZATIONS")
         self.logger.info("="*80)
         
+        # Validate preprocessor is initialized and fitted
+        assert self.preprocessor is not None, "Preprocessor must be initialized before generating visualizations"
+        assert self.preprocessor.demand_features_ is not None, "Preprocessor demand_features_ must be fitted before generating visualizations"
+        assert self.preprocessor.plant_features_ is not None, "Preprocessor plant_features_ must be fitted before generating visualizations"
+        assert self.model is not None, "Model must be trained before generating visualizations"
+        
         # Create visualizer
         viz = Visualizer(output_dir=f"{self.config.results_dir}/plots")
         
-
+        # Generate predictions on training and test sets
+        y_train_pred = self.model.predict(self.baseline_results['X_train'])
+        y_test_pred = self.model.predict(self.baseline_results['X_test'])
         
-        viz.plot_cost_distribution(self.costs_df)
-        viz.plot_plant_performance(self.costs_df)
+        viz.generate_all_plots(
+            costs_df=self.costs_df,
+            model=self.model,
+            feature_names=self.preprocessor.demand_features_ + self.preprocessor.plant_features_,
+            y_train=self.baseline_results['y_train'],
+            y_train_pred=y_train_pred,
+            y_test=self.baseline_results['y_test'],
+            y_test_pred=y_test_pred,
+            scenario_table=self.final_results['scenario_table'],
+            logo_fold_results=self.final_results['logo_fold_results']
+        )
         
         
         

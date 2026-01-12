@@ -198,3 +198,20 @@ class Visualizer:
         plt.close()
         print(f"Saved: {self.output_dir / 'cv_results.png'}")
     
+    def generate_all_plots(self, costs_df, model, feature_names, 
+                          y_train, y_train_pred, y_test, y_test_pred,
+                          scenario_table, logo_fold_results):
+        """Generate all visualization plots"""
+        print("\nGenerating visualizations...")
+        print("=" * 60)
+        
+        self.plot_cost_distribution(costs_df)
+        self.plot_plant_performance(costs_df)
+        self.plot_feature_importance(model, feature_names)
+        self.plot_predictions_analysis(y_train, y_train_pred, 'Training Set')
+        self.plot_predictions_analysis(y_test, y_test_pred, 'Test Set')
+        self.plot_selection_errors(scenario_table)
+        self.plot_cv_results(logo_fold_results)
+        
+        print("=" * 60)
+        print(f"All plots saved to: {self.output_dir}")

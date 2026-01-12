@@ -1,26 +1,53 @@
-# NEC Smart Plant Selection - FAST Configuration
-# This config will complete in ~30-60 minutes instead of 35+ hours
+# NEC Smart Plant Selection - ML Pipeline Configuration
 
+# ============================================================================
+# DATA PATHS
+# ============================================================================
 data:
   demand_path: "data/raw/demand.csv"
   plants_path: "data/raw/plants.csv"
   costs_path: "data/raw/generation_costs.csv"
 
+# ============================================================================
+# MODEL SELECTION
+# ============================================================================
+# Options: 'random_forest', 'gradient_boosting', 'lasso'
 model_type: 'random_forest'
+
+# ============================================================================
+# RANDOM SEED FOR REPRODUCIBILITY
+# ============================================================================
 random_seed: 1072002
 
+# ============================================================================
+# PREPROCESSING CONFIGURATION
+# ============================================================================
 preprocessing:
+  # Plant filtering: remove plants above this cost percentile
   plant_filter_percentile: 75
+  # Missing value strategy: 'mean', 'median', or 'zero'
   missing_value_strategy: 'mean'
 
+# ============================================================================
+# TRAIN/TEST SPLIT
+# ============================================================================
 train_test:
+  # Percentage of demands to use for testing (grouped split)
   test_size_percent: 5
   
+# ============================================================================
+# CROSS-VALIDATION CONFIGURATION  
+# ============================================================================
 cross_validation:
-  # REDUCED from 500 to 50 for speed (still valid evaluation)
-  n_folds: 100
+  # Number of LOGO CV folds (max 500 for all demands)
+  # Set to 500 for comprehensive evaluation
+  n_folds: 500
+  # Number of parallel jobs (-1 = use all cores)
   n_jobs: -1
 
+# ============================================================================
+# MODEL HYPERPARAMETERS
+# ============================================================================
 models:
   random_forest:
     default:
@@ -29,19 +56,47 @@ models:
       min_samples_split: 2
       n_jobs: -1
     tuning_grid:
-      # REDUCED grid search space
-      n_estimators: [50, 100]
-      max_depth: [10, 15]
+      n_estimators: [50, 100, 200]
+      max_depth: [10, 15, 20, null]
+      min_samples_split: [2, 5, 10]
+  
+  gradient_boosting:
+    default:
+      n_estimators: 100
+      max_depth: 5
+      learning_rate: 0.1
+      min_samples_split: 2
+    tuning_grid:
+      n_estimators: [50, 100, 200]
+      max_depth: [3, 5, 7]
+      learning_rate: [0.01, 0.1, 0.2]
       min_samples_split: [2, 5]
+  
+  lasso:
+    default:
+      alpha: 1.0
+      max_iter: 10000
+    tuning_grid:
+      alpha: [0.001, 0.01, 0.1, 1.0, 10.0]
 
+# ============================================================================
+# HYPERPARAMETER OPTIMIZATION
+# ============================================================================
 hyperparameter_optimization:
-  # DISABLED for speed - use default params
+  # Enable hyperparameter tuning
   enabled: true
+  # Scoring metric for optimization (uses custom plant selection error)
+  # Use 'neg_mean_squared_error' for standard RMSE
   scoring: 'custom'
-  cv_folds: 50
+  # Number of CV folds for hyperparameter search
+  cv_folds: 100  # Subset of demands for faster tuning
 
+# ============================================================================
+# OUTPUT CONFIGURATION
+# ============================================================================
 output:
   artifacts_dir: "artifacts"
   results_dir: "outputs"
   logs_dir: "logs"
+  # Verbose logging
   verbose: true
